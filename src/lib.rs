@@ -5,7 +5,10 @@ use aes::{
     Aes256,
 };
 use binrw::BinRead;
+use crc::{Crc, CRC_32_ISO_HDLC};
 use xts_mode::{get_tweak_default, Xts128};
+
+static CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -34,28 +37,40 @@ impl<D: io::Read + io::Seek> Volume<D> {
         // Go to the start of the volume
         self.data.rewind().map_err(|_| Error::InvalidVolume)?;
 
-        // Read salt from volume
-        let mut salt = [0; 64];
+        // Read header
+        let mut header = [0; 512];
         self.data
-            .read_exact(&mut salt)
+            .read_exact(&mut header)
             .map_err(|_| Error::InvalidVolume)?;
+
+        // Read salt from header
+        let salt = &header[0..64];
 
         // Derive keys from password
         let rounds = 500000;
         let mut key = [0; 64];
-        pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha512>>(password.as_bytes(), &salt, rounds, &mut key);
+        pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha512>>(password.as_bytes(), salt, rounds, &mut key);
 
+        // Setup AES XTS decryption
         let cipher_1 = Aes256::new(GenericArray::from_slice(&key[..32]));
         let cipher_2 = Aes256::new(GenericArray::from_slice(&key[32..]));
-
-        let mut buffer = [0; 448];
-        self.data.read_exact(&mut buffer).unwrap();
-
         let xts = Xts128::<Aes256>::new(cipher_1, cipher_2);
 
-        xts.decrypt_area(&mut buffer, 448, 0, get_tweak_default);
+        // Decrypt header
+        xts.decrypt_area(&mut header[64..], 448, 0, get_tweak_default);
 
-        if &buffer[0..4] != "VERA".as_bytes() {
+        // Check magic value
+        if &header[64..68] != "VERA".as_bytes() {
+            return Err(Error::InvalidKey);
+        }
+
+        // Check CRC
+        let chk = CRC.checksum(&header[256..512]);
+        if header[72..76] != chk.to_be_bytes() {
+            return Err(Error::InvalidKey);
+        }
+        let chk = CRC.checksum(&header[64..252]);
+        if header[252..256] != chk.to_be_bytes() {
             return Err(Error::InvalidKey);
         }
 
