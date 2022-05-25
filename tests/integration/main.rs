@@ -7,9 +7,9 @@ fn it_decrypts_file() -> Result<(), Box<dyn Error>> {
     let volume_path = test_dir.join("test.hc");
     let password = "password1234";
 
-    let mut volume = veracrypt::Volume::open(volume_path)?;
+    let volume = veracrypt::UnmountedVolume::open(volume_path)?;
 
-    volume.decrypt(password)?;
+    volume.mount(password)?;
 
     Ok(())
 }
