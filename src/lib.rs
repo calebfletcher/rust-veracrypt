@@ -37,7 +37,11 @@ pub struct MountedVolume<D: io::Read + io::Write + io::Seek> {
 
 impl UnmountedVolume<File> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let file = File::open(path).map_err(Error::FileOpenFailure)?;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(Error::FileOpenFailure)?;
 
         Ok(Self { data: file })
     }
@@ -169,19 +173,113 @@ impl<D: io::Read + io::Write + io::Seek> io::Read for MountedVolume<D> {
                     // copy entire contents
                     buf[bytes_written..bytes_written + DATA_UNIT_SIZE]
                         .copy_from_slice(&temp_buffer);
+                    bytes_written += DATA_UNIT_SIZE;
                 }
             }
         }
+
+        // Reset cursor position to correct location
+        self.data
+            .seek(io::SeekFrom::Start((current_pos + bytes_written) as u64))?;
 
         Ok(bytes_written)
     }
 }
 
 impl<D: io::Read + io::Write + io::Seek> io::Write for MountedVolume<D> {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        // TODO: Encrypt data
-        //unimplemented!();
-        Ok(1)
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let current_pos = self.data.stream_position()? as usize;
+        println!("writing {} bytes at {}", buf.len(), current_pos);
+
+        const DATA_UNIT_SIZE: usize = 512;
+        let mut temp_buffer = [0; DATA_UNIT_SIZE as usize];
+
+        // Calculate data unit boundaries
+        let base_offset = (current_pos / DATA_UNIT_SIZE) * DATA_UNIT_SIZE;
+        let total_bytes_to_read = current_pos + buf.len() - base_offset;
+        let d = total_bytes_to_read / DATA_UNIT_SIZE;
+        let r = total_bytes_to_read % DATA_UNIT_SIZE;
+        let data_units_to_read = if r > 0 { d + 1 } else { d };
+
+        // Move backwards so we end up on a data unit boundary
+        let read_offset = current_pos - base_offset;
+        self.data
+            .seek(io::SeekFrom::Current(-(read_offset as i64)))?;
+        let read_len = buf.len();
+
+        let mut bytes_written = 0;
+        for i in 0..data_units_to_read {
+            // Read data unit
+            self.data.read_exact(&mut temp_buffer)?;
+
+            // Decrypt
+            let sector_size = self.header.sector_size.try_into().unwrap();
+            self.xts.decrypt_area(
+                &mut temp_buffer,
+                sector_size,
+                (current_pos as usize / sector_size).try_into().unwrap(),
+                get_tweak_default,
+            );
+
+            // Update data unit
+            match i {
+                0 => {
+                    // First data unit
+                    // copy [xxx------] into [.......xxx]
+                    //   or [xxx------] into [...xxx....]
+                    let num_bytes_of_interest = (DATA_UNIT_SIZE - read_offset).min(read_len);
+                    temp_buffer[read_offset..read_offset + num_bytes_of_interest]
+                        .copy_from_slice(&buf[0..num_bytes_of_interest]);
+
+                    println!(
+                        "source {} to {} copying into dest unit offsets {} to {}",
+                        0,
+                        num_bytes_of_interest,
+                        read_offset,
+                        read_offset + num_bytes_of_interest
+                    );
+
+                    bytes_written += num_bytes_of_interest;
+                }
+                _ if i == data_units_to_read - 1 => {
+                    // Last data unit
+                    // copy [xxxx.......] into [-------xxxx]
+                    let num_bytes_of_interest = total_bytes_to_read % DATA_UNIT_SIZE;
+                    temp_buffer[0..num_bytes_of_interest]
+                        .copy_from_slice(&buf[read_len - num_bytes_of_interest..]);
+
+                    bytes_written += num_bytes_of_interest;
+                }
+                _ => {
+                    // Middle data unit
+                    // copy entire contents
+                    temp_buffer.copy_from_slice(buf);
+                    bytes_written += DATA_UNIT_SIZE;
+                }
+            }
+
+            // Re-encrypt data unit
+            self.xts.encrypt_area(
+                &mut temp_buffer,
+                sector_size,
+                (current_pos as usize / sector_size).try_into().unwrap(),
+                get_tweak_default,
+            );
+
+            // Write data unit
+            //self.data.write_all(&temp_buffer)?;
+        }
+
+        // Reset cursor position to correct location
+        self.data
+            .seek(io::SeekFrom::Start((current_pos + read_len) as u64))?;
+        let end_pos = self.data.stream_position()? as usize;
+        println!(
+            "start {} ending pos {} ({} bytes)",
+            current_pos, end_pos, read_len
+        );
+
+        Ok(bytes_written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

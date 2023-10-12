@@ -18,12 +18,18 @@ fn main() {
         .filter_map(|entry| entry.ok())
         .collect();
 
-    let mut file = files[0].to_file();
+    let mut f = fs.root_dir().create_file("a.txt").unwrap();
+    f.write_all("hello world!".as_bytes()).unwrap();
+    f.flush().unwrap();
 
-    let new_contents = "something else hello";
-    file.write_all(new_contents.as_bytes()).unwrap();
+    //dbg!(&files);
+    //let file = files[0].to_file();
+    //println!("name: {}", files[0].file_name());
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    dbg!(contents);
+    // let new_contents = "something else hello";
+    // file.write_all(new_contents.as_bytes()).unwrap();
+
+    // let mut contents = String::new();
+    // file.read_to_string(&mut contents).unwrap();
+    // dbg!(contents);
 }
